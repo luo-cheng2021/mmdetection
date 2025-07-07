@@ -20,6 +20,35 @@ from mmdet.registry import MODELS
 from ..layers import PatchEmbed, PatchMerging
 
 
+# https://blog.openvino.ai/blog-posts/custom-pytorch-operations
+class StubAttention(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, qkv: torch.Tensor, mask: torch.Tensor, num_heads, scale, window_size, embed_dims) -> torch.Tensor:
+        B, N, C = qkv.shape
+        qkv = qkv.reshape(B, N, 3, num_heads,
+                                C // num_heads // 3).permute(2, 0, 3, 1, 4)
+        # make torchscript happy (cannot use tensor as tuple)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+
+        q = q * scale
+        attn = (q @ k.transpose(-2, -1))
+
+        attn = attn + mask
+        attn = F.softmax(attn, dim=-1)
+
+        return (attn @ v).transpose(1, 2).reshape(B, N, C // 3)
+
+    @staticmethod
+    def symbolic(g:torch.Graph, qkv: torch.Tensor, mask: torch.Tensor, num_heads, scale, window_size, embed_dims) -> torch.Tensor:
+        attr = g.op("Constant", value_t=torch.ByteTensor(list(bytes(
+                    f'''
+                        out_dt:0 
+                        out_shape:[-1,{window_size*window_size},{embed_dims}]
+                        type:WSAttention 
+                    ''', 
+                    'utf8'))))
+        return g.op("StubOP", qkv, mask, attr)            
+
 class WindowMSA(BaseModule):
     """Window based multi-head self-attention (W-MSA) module with relative
     position bias.
@@ -87,37 +116,53 @@ class WindowMSA(BaseModule):
             mask (tensor | None, Optional): mask with shape of (num_windows,
                 Wh*Ww, Wh*Ww), value should be between (-inf, 0].
         """
-        B, N, C = x.shape
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads,
-                                  C // self.num_heads).permute(2, 0, 3, 1, 4)
-        # make torchscript happy (cannot use tensor as tuple)
-        q, k, v = qkv[0], qkv[1], qkv[2]
-
-        q = q * self.scale
-        attn = (q @ k.transpose(-2, -1))
-
-        relative_position_bias = self.relative_position_bias_table[
-            self.relative_position_index.view(-1)].view(
-                self.window_size[0] * self.window_size[1],
-                self.window_size[0] * self.window_size[1],
-                -1)  # Wh*Ww,Wh*Ww,nH
-        relative_position_bias = relative_position_bias.permute(
-            2, 0, 1).contiguous()  # nH, Wh*Ww, Wh*Ww
-        attn = attn + relative_position_bias.unsqueeze(0)
-
         if mask is not None:
-            nW = mask.shape[0]
-            attn = attn.view(B // nW, nW, self.num_heads, N,
-                             N) + mask.unsqueeze(1).unsqueeze(0)
-            attn = attn.view(-1, self.num_heads, N, N)
-        attn = self.softmax(attn)
+            B, N, C = x.shape
+            qkv = self.qkv(x).reshape(B, N, 3, self.num_heads,
+                                    C // self.num_heads).permute(2, 0, 3, 1, 4)
+            # make torchscript happy (cannot use tensor as tuple)
+            q, k, v = qkv[0], qkv[1], qkv[2]
 
-        attn = self.attn_drop(attn)
+            q = q * self.scale
+            attn = (q @ k.transpose(-2, -1))
 
-        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
-        x = self.proj(x)
-        x = self.proj_drop(x)
-        return x
+            relative_position_bias = self.relative_position_bias_table[
+                self.relative_position_index.view(-1)].view(
+                    self.window_size[0] * self.window_size[1],
+                    self.window_size[0] * self.window_size[1],
+                    -1)  # Wh*Ww,Wh*Ww,nH
+            relative_position_bias = relative_position_bias.permute(
+                2, 0, 1).contiguous()  # nH, Wh*Ww, Wh*Ww
+            attn = attn + relative_position_bias.unsqueeze(0)
+
+            if mask is not None:
+                nW = mask.shape[0]
+                attn = attn.view(B // nW, nW, self.num_heads, N,
+                                N) + mask.unsqueeze(1).unsqueeze(0)
+                attn = attn.view(-1, self.num_heads, N, N)
+            attn = self.softmax(attn)
+
+            attn = self.attn_drop(attn)
+
+            x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+            x = self.proj(x)
+            x = self.proj_drop(x)
+            return x
+        else:
+            qkv = self.qkv(x)
+            relative_position_bias = self.relative_position_bias_table[
+                self.relative_position_index.view(-1)].view(
+                    self.window_size[0] * self.window_size[1],
+                    self.window_size[0] * self.window_size[1],
+                    -1)  # Wh*Ww,Wh*Ww,nH
+            relative_position_bias = relative_position_bias.permute(
+                2, 0, 1).contiguous()  # nH, Wh*Ww, Wh*Ww
+            relative_position_bias = relative_position_bias.unsqueeze(0)
+
+            x = StubAttention.apply(qkv, relative_position_bias, self.num_heads, self.scale, self.window_size[0], self.embed_dims)
+            x = self.proj(x)
+            x = self.proj_drop(x)
+            return x
 
     @staticmethod
     def double_step_seq(step1, len1, step2, len2):
