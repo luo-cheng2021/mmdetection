@@ -135,6 +135,57 @@ class StubPadRollPermute(torch.autograd.Function):
                     ''',
                     'utf8'))))
         return g.op("Stub", query, attr)
+
+class StubPermuteRollCrop(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, attn_windows: torch.Tensor, query_4d: torch.Tensor, shift_size, window_size, embed_dims) -> torch.Tensor:
+        def window_reverse(window_size, windows, H, W):
+            B = int(windows.shape[0] / (H * W / window_size / window_size))
+            x = windows.view(B, H // window_size, W // window_size, window_size,
+                            window_size, -1)
+            x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H, W, -1)
+            return x
+        B, H, W, C = query_4d.shape
+        pad_r = (window_size - W % window_size) % window_size
+        pad_b = (window_size - H % window_size) % window_size
+        H_pad, W_pad = H + pad_b, W + pad_r
+
+        # merge windows
+        attn_windows = attn_windows.view(-1, window_size,
+                                         window_size, C)
+
+        # B H' W' C
+        #shifted_x = self.window_reverse(attn_windows, H_pad, W_pad)
+        shifted_x = window_reverse(window_size, attn_windows, H_pad, W_pad)
+        
+        # reverse cyclic shift
+        if shift_size > 0:
+            x = torch.roll(
+                shifted_x,
+                shifts=(shift_size, shift_size),
+                dims=(1, 2))
+        else:
+            x = shifted_x
+
+        if pad_r > 0 or pad_b:
+            x = x[:, :H, :W, :].contiguous()
+
+        return x
+
+    @staticmethod
+    def symbolic(g:torch.Graph, attn_windows: torch.Tensor, query_4d: torch.Tensor, shift_size, window_size, embed_dims) -> torch.Tensor:
+        attr = g.op("Constant", value_t=torch.ByteTensor(list(bytes(
+                    f'''
+                        out_dt:0 
+                        out_shape:1
+                        type:PermuteRollCrop
+                        HEAD_DIMS:{embed_dims}
+                        WINDOW_SIZE:{window_size}
+                        SHIFT_SIZE:{shift_size}
+                    ''',
+                    'utf8'))))
+        return g.op("Stub", attn_windows, query_4d, attr)
+
 class WindowMSA(BaseModule):
     """Window based multi-head self-attention (W-MSA) module with relative
     position bias.
@@ -352,23 +403,24 @@ class ShiftWindowMSA(BaseModule):
         # W-MSA/SW-MSA (nW*B, window_size*window_size, C)
         attn_windows = self.w_msa(query_windows, mask=attn_mask, HW_pad=torch.tensor(query.shape[1:3], dtype=torch.int32))
 
-        # merge windows
-        attn_windows = attn_windows.view(-1, self.window_size,
-                                         self.window_size, C)
+        x = StubPermuteRollCrop.apply(attn_windows, query, self.shift_size, self.window_size, self.embed_dims)
+        # # merge windows
+        # attn_windows = attn_windows.view(-1, self.window_size,
+        #                                  self.window_size, C)
 
-        # B H' W' C
-        shifted_x = self.window_reverse(attn_windows, H_pad, W_pad)
-        # reverse cyclic shift
-        if self.shift_size > 0:
-            x = torch.roll(
-                shifted_x,
-                shifts=(self.shift_size, self.shift_size),
-                dims=(1, 2))
-        else:
-            x = shifted_x
+        # # B H' W' C
+        # shifted_x = self.window_reverse(attn_windows, H_pad, W_pad)
+        # # reverse cyclic shift
+        # if self.shift_size > 0:
+        #     x = torch.roll(
+        #         shifted_x,
+        #         shifts=(self.shift_size, self.shift_size),
+        #         dims=(1, 2))
+        # else:
+        #     x = shifted_x
 
-        if pad_r > 0 or pad_b:
-            x = x[:, :H, :W, :].contiguous()
+        # if pad_r > 0 or pad_b:
+        #     x = x[:, :H, :W, :].contiguous()
 
         x = x.view(B, H * W, C)
 
