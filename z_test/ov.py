@@ -28,7 +28,7 @@ def preprocess_images(image_paths, shape=(512,512)):
     images = []
     for path in image_paths:
         images.append(preprocess_image(path, shape))
-
+    
     return torch.stack(images, dim=0)
 
 
@@ -353,23 +353,24 @@ def parse_args():
     return args
 
 cfg = {
-    'name': './models/bert-base-uncased',
+    'name': '/mnt/luocheng/mmdetection/models/bert-base-uncased/',
     'max_tokens': 256,
     'special_tokens_list': ['[CLS]', '[SEP]', '.', '?'],
     'max_per_img':  300
 }
 tokenizer = AutoTokenizer.from_pretrained(cfg['name'])
 
-def main():
-    args = parse_args()
+def main(args, model):
 
     if args.images.find(',') > 0:
         image_paths = args.images.split(',')
     else:
         image_paths = [args.images]
     bs = len(image_paths)
+    core = ov.Core()
+    core.add_extension('/mnt/luocheng/aboutSHW/opencl/tests/grounding_dino/ext/build/libstub.so')
 
-    model = ov.compile_model(args.model, args.device)
+    model = core.compile_model(model, args.device)
 
     img_shape = (model.inputs[0].partial_shape[2].get_max_length(),
                  model.inputs[0].partial_shape[3].get_max_length())
@@ -380,6 +381,7 @@ def main():
     text_prompts = args.prompt
 
     token_positive_map, classes = get_positive_map(text_prompts)
+    print(token_positive_map, classes)
 
     tokenized = tokenizer.batch_encode_plus(
             [text_prompts] * bs,
@@ -391,8 +393,27 @@ def main():
 
     special_tokens = tokenizer.convert_tokens_to_ids(cfg['special_tokens_list'])
     attention_mask, position_ids = generate_masks_with_special_tokens(tokenized, special_tokens)
+    print(tokenized['input_ids'], position_ids, attention_mask)
 
     cls, bbox = infer_once(model, batch_img, tokenized['input_ids'], position_ids, attention_mask)
+
+
+    # import onnxruntime as ort
+    # import numpy as np
+    # import onnx
+    # onnx_model = onnx.load("gdino_swinb_800_1333.onnx")
+    # onnx.checker.check_model(onnx_model)
+    # ort_sess = ort.InferenceSession('gdino_swinb_800_1333.onnx')
+    # inputs = {}
+    # inputs["img"] = batch_img
+    # inputs["input_ids"] = tokenized['input_ids']
+    # inputs["text_token_mask"] = attention_mask
+    # inputs["position_ids"] = position_ids
+    # onnx.checker.check_model(model, full_check=True)
+    # outputs = ort_sess.run(None, inputs)
+
+    # # Print Result
+    # print(f'onnx Predicted: "{outputs}"')
 
     assert(cls.shape[0] == bs and bbox.shape[0] == bs)
     outdir = Path(args.outdir)
@@ -401,6 +422,23 @@ def main():
         print(f"to annotate {output_file}")
         annotate_once(image_paths[i], output_file, classes, cls[i], bbox[i], token_positive_map, args.threshold)
 
+    return cls, bbox
+
 
 if __name__ == '__main__':
-    main()
+    args = parse_args()
+
+    results = []
+    for model in [
+        'gdino_swinb_800_1333.onnx',
+        #'new_gdino_swinb_800_1333.onnx',
+        #'way-gdino_swinb_800_1333.onnx'
+    ]:
+        print(f'testing {model}...')
+        ret = main(args, model)
+        results.append(ret)
+
+    if not torch.allclose(results[0][0], results[1][0], atol=1, rtol=0.01):
+        print(f'cls not same: {results[0][0]=}\n{results[1][0]=}')
+    if not torch.allclose(results[0][1], results[1][1], atol=1, rtol=0.01):
+        print(f'bbox not same: {results[0][1]=}\n{results[1][1]=}')

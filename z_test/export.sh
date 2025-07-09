@@ -1,0 +1,1 @@
+python export_groundingdino_openvino.py ../configs/mm_grounding_dino/grounding_dino_swin-b_pretrain_obj365_goldg_v3det.py  ../models/grounding_dino_swin-b_pretrain_obj365_goldg_v3de-f83eef00.pth 800 1333

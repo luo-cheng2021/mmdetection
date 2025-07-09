@@ -91,7 +91,50 @@ class StubSWAttention(torch.autograd.Function):
                     'utf8'))))
         return g.op("Stub", qkv, mask, rotate_mask, HW_pad, attr)
 
+class StubPadRollPermute(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, query: torch.Tensor, shift_size, window_size, embed_dims) -> torch.Tensor:
+        B, H, W, C = query.shape
+        pad_r = (window_size - W % window_size) % window_size
+        pad_b = (window_size - H % window_size) % window_size
 
+        query = F.pad(query, (0, 0, 0, pad_r, 0, pad_b))
+
+        # cyclic shift
+        if shift_size > 0:
+            shifted_query = torch.roll(
+                query,
+                shifts=(-shift_size, -shift_size),
+                dims=(1, 2))
+        else:
+            shifted_query = query
+
+        # nW*B, window_size, window_size, C
+        # query_windows = self.window_partition(shifted_query)
+        B, H, W, C = query.shape
+        shifted_query = shifted_query.view(B, H // window_size, window_size, W // window_size,
+                   window_size, C)
+        windows = shifted_query.permute(0, 1, 3, 2, 4, 5).contiguous()
+        query_windows = windows.view(-1, window_size, window_size, C)
+
+        # nW*B, window_size*window_size, C
+        query_windows = query_windows.view(-1, window_size**2, C)
+
+        return query_windows
+
+    @staticmethod
+    def symbolic(g:torch.Graph, query: torch.Tensor, shift_size, window_size, embed_dims) -> torch.Tensor:
+        attr = g.op("Constant", value_t=torch.ByteTensor(list(bytes(
+                    f'''
+                        out_dt:0 
+                        out_shape:[-1,{window_size*window_size},{embed_dims}]
+                        type:PadRollPermute 
+                        HEAD_DIMS:{embed_dims}
+                        WINDOW_SIZE:{window_size}
+                        SHIFT_SIZE:{shift_size}
+                    ''',
+                    'utf8'))))
+        return g.op("Stub", query, attr)
 class WindowMSA(BaseModule):
     """Window based multi-head self-attention (W-MSA) module with relative
     position bias.
@@ -235,6 +278,7 @@ class ShiftWindowMSA(BaseModule):
 
         self.window_size = window_size
         self.shift_size = shift_size
+        self.embed_dims = embed_dims
         assert 0 <= self.shift_size < self.window_size
 
         self.w_msa = WindowMSA(
@@ -253,21 +297,33 @@ class ShiftWindowMSA(BaseModule):
         B, L, C = query.shape
         H, W = hw_shape
         assert L == H * W, 'input feature has wrong size'
-        query = query.view(B, H, W, C)
 
         # pad feature maps to multiples of window size
         pad_r = (self.window_size - W % self.window_size) % self.window_size
         pad_b = (self.window_size - H % self.window_size) % self.window_size
-        query = F.pad(query, (0, 0, 0, pad_r, 0, pad_b))
-        H_pad, W_pad = query.shape[1], query.shape[2]
+        #H_pad, W_pad = query.shape[1], query.shape[2]
+        H_pad, W_pad = H + pad_b, W + pad_r
+        query = query.view(B, H, W, C)
 
-        # cyclic shift
+        query_windows = StubPadRollPermute.apply(query, self.shift_size, self.window_size, self.embed_dims)
+        # query = query.view(B, H, W, C)
+        # query = F.pad(query, (0, 0, 0, pad_r, 0, pad_b))
+
+        # # cyclic shift
+        # if self.shift_size > 0:
+        #     shifted_query = torch.roll(
+        #         query,
+        #         shifts=(-self.shift_size, -self.shift_size),
+        #         dims=(1, 2))
+        # else:
+        #     shifted_query = query
+
+        # # nW*B, window_size, window_size, C
+        # query_windows = self.window_partition(shifted_query)
+        # # nW*B, window_size*window_size, C
+        # query_windows = query_windows.view(-1, self.window_size**2, C)
+
         if self.shift_size > 0:
-            shifted_query = torch.roll(
-                query,
-                shifts=(-self.shift_size, -self.shift_size),
-                dims=(1, 2))
-
             # calculate attention mask for SW-MSA
             img_mask = torch.zeros((1, H_pad, W_pad, 1), device=query.device)
             h_slices = (slice(0, -self.window_size),
@@ -291,13 +347,7 @@ class ShiftWindowMSA(BaseModule):
                                               float(-100.0)).masked_fill(
                                                   attn_mask == 0, float(0.0))
         else:
-            shifted_query = query
             attn_mask = None
-
-        # nW*B, window_size, window_size, C
-        query_windows = self.window_partition(shifted_query)
-        # nW*B, window_size*window_size, C
-        query_windows = query_windows.view(-1, self.window_size**2, C)
 
         # W-MSA/SW-MSA (nW*B, window_size*window_size, C)
         attn_windows = self.w_msa(query_windows, mask=attn_mask, HW_pad=torch.tensor(query.shape[1:3], dtype=torch.int32))
