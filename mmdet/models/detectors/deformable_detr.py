@@ -16,6 +16,34 @@ from ..layers import (DeformableDetrTransformerDecoder,
                       DeformableDetrTransformerEncoder, SinePositionalEncoding)
 from .base_detr import DetectionTransformer
 
+class StubPermuteAddConcat(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, head_dims, *mlvl_pos_embeds_bias) -> torch.Tensor:
+        lvl_pos_embed_flatten = []
+        num = len(mlvl_pos_embeds_bias) // 2
+        for lvl in range(num):
+            pos_embed = mlvl_pos_embeds_bias[lvl]
+            #pos_embed = pos_embed.view(batch_size, c, -1).permute(0, 2, 1)
+            lvl_pos_embed = pos_embed + mlvl_pos_embeds_bias[lvl + num].view(1, 1, -1)
+
+            lvl_pos_embed_flatten.append(lvl_pos_embed)
+
+        lvl_pos_embed_flatten = torch.cat(lvl_pos_embed_flatten, 1)
+
+        return lvl_pos_embed_flatten
+
+    @staticmethod
+    def symbolic(g:torch.Graph, head_dims, *mlvl_pos_embeds_bias) -> torch.Tensor:
+        attr = g.op("Constant", value_t=torch.ByteTensor(list(bytes(
+                    f'''
+                        out_dt:0 
+                        out_shape:[-1,-1,{head_dims}]
+                        HEAD_DIMS:{head_dims}
+                        type:PermuteAddConcat
+                        num:{len(mlvl_pos_embeds_bias)//2}
+                    ''',
+                    'utf8'))))
+        return g.op("Stub", *mlvl_pos_embeds_bias, attr)
 
 @MODELS.register_module()
 class DeformableDETR(DetectionTransformer):
@@ -194,19 +222,30 @@ class DeformableDETR(DetectionTransformer):
             # [bs, c, h_lvl, w_lvl] -> [bs, h_lvl*w_lvl, c]
             feat = feat.view(batch_size, c, -1).permute(0, 2, 1)
             pos_embed = pos_embed.view(batch_size, c, -1).permute(0, 2, 1)
-            lvl_pos_embed = pos_embed + self.level_embed[lvl].view(1, 1, -1)
+            mlvl_pos_embeds[lvl] = pos_embed
+            #lvl_pos_embed = pos_embed + self.level_embed[lvl].view(1, 1, -1)
             # [bs, h_lvl, w_lvl] -> [bs, h_lvl*w_lvl]
             if mask is not None:
                 mask = mask.flatten(1)
 
             feat_flatten.append(feat)
-            lvl_pos_embed_flatten.append(lvl_pos_embed)
+            #lvl_pos_embed_flatten.append(lvl_pos_embed)
             mask_flatten.append(mask)
             spatial_shapes.append(spatial_shape)
 
+        lvl_pos_embed_flatten = StubPermuteAddConcat.apply(int(c), *tuple(mlvl_pos_embeds + [self.level_embed[x] for x in range(self.num_feature_levels)]))
+        # for lvl, pos_embed in enumerate(
+        #         mlvl_pos_embeds):
+        #     batch_size, c, h, w = pos_embed.shape
+        #     pos_embed = pos_embed.view(batch_size, c, -1).permute(0, 2, 1)
+        #     lvl_pos_embed = pos_embed + self.level_embed[lvl].view(1, 1, -1)
+
+        #     lvl_pos_embed_flatten.append(lvl_pos_embed)
+
+        # lvl_pos_embed_flatten = torch.cat(lvl_pos_embed_flatten, 1)
+
         # (bs, num_feat_points, dim)
         feat_flatten = torch.cat(feat_flatten, 1)
-        lvl_pos_embed_flatten = torch.cat(lvl_pos_embed_flatten, 1)
         # (bs, num_feat_points), where num_feat_points = sum_lvl(h_lvl*w_lvl)
         if mask_flatten[0] is not None:
             mask_flatten = torch.cat(mask_flatten, 1)

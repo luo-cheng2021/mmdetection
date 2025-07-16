@@ -1,3 +1,4 @@
+# copy from https://github.com/wayfeng/mmdetection/tree/main/openvino
 import torch
 from argparse import ArgumentParser
 from mmdet.apis import DetInferencer

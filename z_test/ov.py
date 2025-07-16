@@ -1,3 +1,4 @@
+# copy from https://github.com/wayfeng/mmdetection/tree/main/openvino
 import cv2
 import re
 import torch

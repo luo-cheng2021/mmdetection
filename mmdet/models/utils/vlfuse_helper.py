@@ -67,6 +67,30 @@ def clamp_values(vector: Tensor) -> Tensor:
     vector = torch.clamp(vector, min=-MAX_CLAMP_VALUE, max=MAX_CLAMP_VALUE)
     return vector
 
+class StubMaxSubClip(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, attn_weights_T: torch.Tensor) -> torch.Tensor:
+        attn_weights_l = (
+            attn_weights_T -
+            torch.max(attn_weights_T, dim=-1, keepdim=True)[0])
+        # Do not increase -50000, data type half has quite limited range
+        attn_weights_l = torch.clamp(attn_weights_l, min=-MAX_CLAMP_VALUE)
+        # Do not increase 50000, data type half has quite limited range
+        attn_weights_l = torch.clamp(attn_weights_l, max=MAX_CLAMP_VALUE)
+
+        return attn_weights_l
+
+    @staticmethod
+    def symbolic(g:torch.Graph, attn_weights: torch.Tensor) -> torch.Tensor:
+        attr = g.op("Constant", value_t=torch.ByteTensor(list(bytes(
+                    f'''
+                        out_dt:0 
+                        out_shape:0
+                        type:MaxSubClip
+                        MAX_CLAMP_VALUE:{MAX_CLAMP_VALUE:.1f}
+                    ''',
+                    'utf8'))))
+        return g.op("Stub", attn_weights, attr)
 
 class BiMultiHeadAttention(nn.Module):
     """Bidirectional fusion Multi-Head Attention layer.
@@ -174,15 +198,18 @@ class BiMultiHeadAttention(nn.Module):
             attn_weights = torch.clamp(attn_weights, max=MAX_CLAMP_VALUE)
 
         attn_weights_T = attn_weights.transpose(1, 2)
-        attn_weights_l = (
-            attn_weights_T -
-            torch.max(attn_weights_T, dim=-1, keepdim=True)[0])
-        if self.clamp_min_for_underflow:
-            # Do not increase -50000, data type half has quite limited range
-            attn_weights_l = torch.clamp(attn_weights_l, min=-MAX_CLAMP_VALUE)
-        if self.clamp_max_for_overflow:
-            # Do not increase 50000, data type half has quite limited range
-            attn_weights_l = torch.clamp(attn_weights_l, max=MAX_CLAMP_VALUE)
+        ##################################################
+        attn_weights_l = StubMaxSubClip.apply(attn_weights_T)
+        # attn_weights_l = (
+        #     attn_weights_T -
+        #     torch.max(attn_weights_T, dim=-1, keepdim=True)[0])
+        # if self.clamp_min_for_underflow:
+        #     # Do not increase -50000, data type half has quite limited range
+        #     attn_weights_l = torch.clamp(attn_weights_l, min=-MAX_CLAMP_VALUE)
+        # if self.clamp_max_for_overflow:
+        #     # Do not increase 50000, data type half has quite limited range
+        #     attn_weights_l = torch.clamp(attn_weights_l, max=MAX_CLAMP_VALUE)
+        ###################################################
 
         if attention_mask_v is not None:
             attention_mask_v = (

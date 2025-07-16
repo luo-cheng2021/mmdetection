@@ -371,8 +371,12 @@ class GroundingDINO(DINO):
         # multi-class classification, while DeformDETR, where the input
         # is `enc_outputs_class[..., 0]` selects according to scores of
         # binary classification.
+        import torch.nn.functional as F
+        max_tmp = enc_outputs_class.max(-1)[0]
+        aligend = (max_tmp.shape[1] + 511) // 512 * 512
+        padded = F.pad(max_tmp, (0, aligend - max_tmp.shape[1]), value=-10000)
         topk_indices = torch.topk(
-            enc_outputs_class.max(-1)[0], k=self.num_queries, dim=1)[1]
+            padded, k=self.num_queries, dim=1)[1]
 
         topk_score = torch.gather(
             enc_outputs_class, 1,
