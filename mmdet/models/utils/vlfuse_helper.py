@@ -91,6 +91,116 @@ class StubMaxSubClip(torch.autograd.Function):
                     ''',
                     'utf8'))))
         return g.op("Stub", attn_weights, attr)
+    
+class StubBiAttention(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, query_states: torch.Tensor, proj_key: torch.Tensor, proj_vision_values: torch.Tensor, proj_lang_values: torch.Tensor, attention_mask_l: torch.Tensor, num_heads, head_dim) -> torch.Tensor:
+        def _shape(tensor: torch.Tensor, seq_len: int, bsz: int):
+            return tensor.view(bsz, seq_len, num_heads,
+                            head_dim).transpose(1, 2).contiguous()
+        bsz, tgt_len, _ = query_states.shape
+        key_states = _shape(proj_key, -1, bsz)
+        value_v_states = _shape(proj_vision_values, -1, bsz)
+        value_l_states = _shape(proj_lang_values, -1, bsz)
+
+        proj_shape = (bsz * num_heads, -1, head_dim)
+        query_states = _shape(query_states, tgt_len,
+                                   bsz).view(*proj_shape)
+        key_states = key_states.view(*proj_shape)
+        value_v_states = value_v_states.view(*proj_shape)
+        value_l_states = value_l_states.view(*proj_shape)
+
+        src_len = key_states.size(1)
+        attn_weights = torch.bmm(query_states, key_states.transpose(1, 2))
+
+        # if self.stable_softmax_2d:
+        #     attn_weights = attn_weights - attn_weights.max()
+
+        if True:
+            # Do not increase -50000, data type half has quite limited range
+            attn_weights = torch.clamp(attn_weights, min=-MAX_CLAMP_VALUE)
+        if True:
+            # Do not increase 50000, data type half has quite limited range
+            attn_weights = torch.clamp(attn_weights, max=MAX_CLAMP_VALUE)
+
+        attn_weights_T = attn_weights.transpose(1, 2)
+        attn_weights_l = (
+            attn_weights_T -
+            torch.max(attn_weights_T, dim=-1, keepdim=True)[0])
+        if True:
+            # Do not increase -50000, data type half has quite limited range
+            attn_weights_l = torch.clamp(attn_weights_l, min=-MAX_CLAMP_VALUE)
+        if True:
+            # Do not increase 50000, data type half has quite limited range
+            attn_weights_l = torch.clamp(attn_weights_l, max=MAX_CLAMP_VALUE)
+
+        # if attention_mask_v is not None:
+        #     attention_mask_v = (
+        #         attention_mask_v[:, None,
+        #                          None, :].repeat(1, self.num_heads, 1,
+        #                                          1).flatten(0, 1))
+        #     attn_weights_l.masked_fill_(attention_mask_v, float('-inf'))
+
+        attn_weights_l = attn_weights_l.softmax(dim=-1)
+
+        if attention_mask_l is not None:
+            # assert (attention_mask_l.dim() == 2)
+            attention_mask = attention_mask_l.unsqueeze(1).unsqueeze(1)
+            # attention_mask = attention_mask.expand(bsz, 1, tgt_len, src_len)
+            # attention_mask = attention_mask.masked_fill(
+            #     attention_mask == 0, -9e15)
+
+            # if attention_mask_l.size() != (bsz, 1, tgt_len, src_len):
+            #     raise ValueError('Attention mask should be of '
+            #                      f'size {(bsz, 1, tgt_len, src_len)}')
+            attn_weights = attn_weights.view(bsz, num_heads, tgt_len,
+                                             src_len) + attention_mask
+            attn_weights = attn_weights.view(bsz * num_heads, tgt_len,
+                                             src_len)
+
+        attn_weights_v = nn.functional.softmax(attn_weights, dim=-1)
+
+        # attn_probs_v = F.dropout(
+        #     attn_weights_v, p=self.dropout, training=self.training)
+        # attn_probs_l = F.dropout(
+        #     attn_weights_l, p=self.dropout, training=self.training)
+        attn_probs_v = attn_weights_v
+        attn_probs_l = attn_weights_l
+
+        attn_output_v = torch.bmm(attn_probs_v, value_l_states)
+        attn_output_l = torch.bmm(attn_probs_l, value_v_states)
+
+        attn_output_v = attn_output_v.view(bsz, num_heads, tgt_len,
+                                           head_dim)
+        attn_output_v = attn_output_v.transpose(1, 2)
+        #attn_output_v = attn_output_v.reshape(bsz, tgt_len, embed_dim)
+        attn_output_v = attn_output_v.reshape(bsz, tgt_len, -1)
+
+        attn_output_l = attn_output_l.view(bsz, num_heads, src_len,
+                                           head_dim)
+        attn_output_l = attn_output_l.transpose(1, 2)
+        # attn_output_l = attn_output_l.reshape(bsz, src_len, embed_dim)
+        attn_output_l = attn_output_l.reshape(bsz, src_len, -1)
+        return attn_output_v, attn_output_l
+
+    @staticmethod
+    def symbolic(g:torch.Graph, query_states: torch.Tensor, proj_key: torch.Tensor, proj_vision_values: torch.Tensor, proj_lang_values: torch.Tensor, attention_mask_l: torch.Tensor, num_heads, head_dim) -> torch.Tensor:
+        attr = g.op("Constant", value_t=torch.ByteTensor(list(bytes(
+                    f'''
+                        out_dt:0 
+                        out_shape:0
+                        out_dt1:1
+                        out_shape1:1
+                        type:BiAttention
+                        NUM_HEADS:{num_heads}
+                        NUM_KV_HEADS:{num_heads}
+                        HEAD_SIZE:{head_dim}
+                        SCALE:1
+                        MAX_CLAMP_VALUE:{MAX_CLAMP_VALUE:.1f}
+                    ''',
+                    'utf8'))))
+        attn_output_v, attn_output_l = g.op("Stub", query_states, proj_key, proj_vision_values, proj_lang_values, attention_mask_l, attr, outputs=2)
+        return attn_output_v, attn_output_l
 
 class BiMultiHeadAttention(nn.Module):
     """Bidirectional fusion Multi-Head Attention layer.
@@ -167,107 +277,118 @@ class BiMultiHeadAttention(nn.Module):
         bsz, tgt_len, _ = vision.size()
 
         query_states = self.v_proj(vision) * self.scale
-        key_states = self._shape(self.l_proj(lang), -1, bsz)
-        value_v_states = self._shape(self.values_v_proj(vision), -1, bsz)
-        value_l_states = self._shape(self.values_l_proj(lang), -1, bsz)
+        proj_key = self.l_proj(lang)
+        proj_vision_values = self.values_v_proj(vision)
+        proj_lang_values = self.values_l_proj(lang)
 
-        proj_shape = (bsz * self.num_heads, -1, self.head_dim)
-        query_states = self._shape(query_states, tgt_len,
-                                   bsz).view(*proj_shape)
-        key_states = key_states.view(*proj_shape)
-        value_v_states = value_v_states.view(*proj_shape)
-        value_l_states = value_l_states.view(*proj_shape)
+        assert (attention_mask_l.dim() == 2)
+        attention_mask_l = attention_mask_l.masked_fill(
+            attention_mask_l == 0, -9e15).to(dtype=torch.float32)
 
-        src_len = key_states.size(1)
-        attn_weights = torch.bmm(query_states, key_states.transpose(1, 2))
+        attn_output_v, attn_output_l = StubBiAttention.apply(query_states, proj_key, proj_vision_values, proj_lang_values, attention_mask_l, self.num_heads, self.head_dim)
+        # key_states = self._shape(proj_lang, -1, bsz)
+        # value_v_states = self._shape(proj_vision, -1, bsz)
+        # value_l_states = self._shape(proj_lang_values, -1, bsz)
 
-        if attn_weights.size() != (bsz * self.num_heads, tgt_len, src_len):
-            raise ValueError(
-                f'Attention weights should be of '
-                f'size {(bsz * self.num_heads, tgt_len, src_len)}, '
-                f'but is {attn_weights.size()}')
+        # proj_shape = (bsz * self.num_heads, -1, self.head_dim)
+        # query_states = self._shape(query_states, tgt_len,
+        #                            bsz).view(*proj_shape)
+        # key_states = key_states.view(*proj_shape)
+        # value_v_states = value_v_states.view(*proj_shape)
+        # value_l_states = value_l_states.view(*proj_shape)
 
-        if self.stable_softmax_2d:
-            attn_weights = attn_weights - attn_weights.max()
+        # src_len = key_states.size(1)
+        # attn_weights = torch.bmm(query_states, key_states.transpose(1, 2))
 
-        if self.clamp_min_for_underflow:
-            # Do not increase -50000, data type half has quite limited range
-            attn_weights = torch.clamp(attn_weights, min=-MAX_CLAMP_VALUE)
-        if self.clamp_max_for_overflow:
-            # Do not increase 50000, data type half has quite limited range
-            attn_weights = torch.clamp(attn_weights, max=MAX_CLAMP_VALUE)
+        # if attn_weights.size() != (bsz * self.num_heads, tgt_len, src_len):
+        #     raise ValueError(
+        #         f'Attention weights should be of '
+        #         f'size {(bsz * self.num_heads, tgt_len, src_len)}, '
+        #         f'but is {attn_weights.size()}')
 
-        attn_weights_T = attn_weights.transpose(1, 2)
-        ##################################################
-        attn_weights_l = StubMaxSubClip.apply(attn_weights_T)
-        # attn_weights_l = (
-        #     attn_weights_T -
-        #     torch.max(attn_weights_T, dim=-1, keepdim=True)[0])
+        # if self.stable_softmax_2d:
+        #     attn_weights = attn_weights - attn_weights.max()
+
         # if self.clamp_min_for_underflow:
         #     # Do not increase -50000, data type half has quite limited range
-        #     attn_weights_l = torch.clamp(attn_weights_l, min=-MAX_CLAMP_VALUE)
+        #     attn_weights = torch.clamp(attn_weights, min=-MAX_CLAMP_VALUE)
         # if self.clamp_max_for_overflow:
         #     # Do not increase 50000, data type half has quite limited range
-        #     attn_weights_l = torch.clamp(attn_weights_l, max=MAX_CLAMP_VALUE)
-        ###################################################
+        #     attn_weights = torch.clamp(attn_weights, max=MAX_CLAMP_VALUE)
 
-        if attention_mask_v is not None:
-            attention_mask_v = (
-                attention_mask_v[:, None,
-                                 None, :].repeat(1, self.num_heads, 1,
-                                                 1).flatten(0, 1))
-            attn_weights_l.masked_fill_(attention_mask_v, float('-inf'))
+        # attn_weights_T = attn_weights.transpose(1, 2)
+        # ##################################################
+        # attn_weights_l = StubMaxSubClip.apply(attn_weights_T)
+        # # attn_weights_l = (
+        # #     attn_weights_T -
+        # #     torch.max(attn_weights_T, dim=-1, keepdim=True)[0])
+        # # if self.clamp_min_for_underflow:
+        # #     # Do not increase -50000, data type half has quite limited range
+        # #     attn_weights_l = torch.clamp(attn_weights_l, min=-MAX_CLAMP_VALUE)
+        # # if self.clamp_max_for_overflow:
+        # #     # Do not increase 50000, data type half has quite limited range
+        # #     attn_weights_l = torch.clamp(attn_weights_l, max=MAX_CLAMP_VALUE)
+        # ###################################################
 
-        attn_weights_l = attn_weights_l.softmax(dim=-1)
+        # if attention_mask_v is not None:
+        #     attention_mask_v = (
+        #         attention_mask_v[:, None,
+        #                          None, :].repeat(1, self.num_heads, 1,
+        #                                          1).flatten(0, 1))
+        #     attn_weights_l.masked_fill_(attention_mask_v, float('-inf'))
 
-        if attention_mask_l is not None:
-            assert (attention_mask_l.dim() == 2)
-            attention_mask = attention_mask_l.unsqueeze(1).unsqueeze(1)
-            attention_mask = attention_mask.expand(bsz, 1, tgt_len, src_len)
-            attention_mask = attention_mask.masked_fill(
-                attention_mask == 0, -9e15)
+        # attn_weights_l = attn_weights_l.softmax(dim=-1)
 
-            if attention_mask.size() != (bsz, 1, tgt_len, src_len):
-                raise ValueError('Attention mask should be of '
-                                 f'size {(bsz, 1, tgt_len, src_len)}')
-            attn_weights = attn_weights.view(bsz, self.num_heads, tgt_len,
-                                             src_len) + attention_mask
-            attn_weights = attn_weights.view(bsz * self.num_heads, tgt_len,
-                                             src_len)
+        # if attention_mask_l is not None:
+        #     assert (attention_mask_l.dim() == 2)
+        #     attention_mask = attention_mask_l.unsqueeze(1).unsqueeze(1)
+        #     attention_mask = attention_mask.expand(bsz, 1, tgt_len, src_len)
+        #     attention_mask = attention_mask.masked_fill(
+        #         attention_mask == 0, -9e15)
 
-        attn_weights_v = nn.functional.softmax(attn_weights, dim=-1)
+        #     if attention_mask.size() != (bsz, 1, tgt_len, src_len):
+        #         raise ValueError('Attention mask should be of '
+        #                          f'size {(bsz, 1, tgt_len, src_len)}')
+        #     attn_weights = attn_weights.view(bsz, self.num_heads, tgt_len,
+        #                                      src_len) + attention_mask
+        #     attn_weights = attn_weights.view(bsz * self.num_heads, tgt_len,
+        #                                      src_len)
 
-        attn_probs_v = F.dropout(
-            attn_weights_v, p=self.dropout, training=self.training)
-        attn_probs_l = F.dropout(
-            attn_weights_l, p=self.dropout, training=self.training)
+        # attn_weights_v = nn.functional.softmax(attn_weights, dim=-1)
 
-        attn_output_v = torch.bmm(attn_probs_v, value_l_states)
-        attn_output_l = torch.bmm(attn_probs_l, value_v_states)
+        # attn_probs_v = F.dropout(
+        #     attn_weights_v, p=self.dropout, training=self.training)
+        # attn_probs_l = F.dropout(
+        #     attn_weights_l, p=self.dropout, training=self.training)
 
-        if attn_output_v.size() != (bsz * self.num_heads, tgt_len,
-                                    self.head_dim):
-            raise ValueError(
-                '`attn_output_v` should be of '
-                f'size {(bsz, self.num_heads, tgt_len, self.head_dim)}, '
-                f'but is {attn_output_v.size()}')
+        # attn_output_v = torch.bmm(attn_probs_v, value_l_states)
+        # attn_output_l = torch.bmm(attn_probs_l, value_v_states)
 
-        if attn_output_l.size() != (bsz * self.num_heads, src_len,
-                                    self.head_dim):
-            raise ValueError(
-                '`attn_output_l` should be of size '
-                f'{(bsz, self.num_heads, src_len, self.head_dim)}, '
-                f'but is {attn_output_l.size()}')
+        # if attn_output_v.size() != (bsz * self.num_heads, tgt_len,
+        #                             self.head_dim):
+        #     raise ValueError(
+        #         '`attn_output_v` should be of '
+        #         f'size {(bsz, self.num_heads, tgt_len, self.head_dim)}, '
+        #         f'but is {attn_output_v.size()}')
 
-        attn_output_v = attn_output_v.view(bsz, self.num_heads, tgt_len,
-                                           self.head_dim)
-        attn_output_v = attn_output_v.transpose(1, 2)
-        attn_output_v = attn_output_v.reshape(bsz, tgt_len, self.embed_dim)
+        # if attn_output_l.size() != (bsz * self.num_heads, src_len,
+        #                             self.head_dim):
+        #     raise ValueError(
+        #         '`attn_output_l` should be of size '
+        #         f'{(bsz, self.num_heads, src_len, self.head_dim)}, '
+        #         f'but is {attn_output_l.size()}')
 
-        attn_output_l = attn_output_l.view(bsz, self.num_heads, src_len,
-                                           self.head_dim)
-        attn_output_l = attn_output_l.transpose(1, 2)
-        attn_output_l = attn_output_l.reshape(bsz, src_len, self.embed_dim)
+        # attn_output_v = attn_output_v.view(bsz, self.num_heads, tgt_len,
+        #                                    self.head_dim)
+        # attn_output_v = attn_output_v.transpose(1, 2)
+        # attn_output_v = attn_output_v.reshape(bsz, tgt_len, self.embed_dim)
+
+        # attn_output_l = attn_output_l.view(bsz, self.num_heads, src_len,
+        #                                    self.head_dim)
+        # attn_output_l = attn_output_l.transpose(1, 2)
+        # attn_output_l = attn_output_l.reshape(bsz, src_len, self.embed_dim)
+
+
 
         attn_output_v = self.out_v_proj(attn_output_v)
         attn_output_l = self.out_l_proj(attn_output_l)
